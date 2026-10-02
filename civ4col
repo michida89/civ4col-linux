@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# civ4col — запуск Civilization IV: Colonization (RaR/KLT) через Wine.
+# Настройки берутся из ~/.config/civ4col/civ4col.conf (его создаёт install.sh).
+set -uo pipefail
+
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/civ4col/civ4col.conf"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/civ4col"
+LOG="$STATE_DIR/last-run.log"
+
+die() {
+    echo "civ4col: $*" >&2
+    # Если запустили из меню (без терминала) — покажем ошибку окном
+    if [ ! -t 2 ] && command -v zenity >/dev/null 2>&1; then
+        zenity --error --title="Civ4 Colonization" --text="$*" 2>/dev/null
+    fi
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+Использование: civ4col [опции]
+
+  (без опций)          запустить игру
+  -w, --window[=WxH]   запустить в окне (виртуальный рабочий стол Wine),
+                       по умолчанию 1920x1080, например --window=1600x900
+  -l, --log            подробный лог Wine в ~/.local/state/civ4col/last-run.log
+      --winecfg        открыть настройки Wine для префикса игры
+      --kill           принудительно закрыть зависшую игру
+      --doctor         проверить, всё ли установлено
+  -h, --help           эта справка
+EOF
+}
+
+[ -f "$CONF" ] || die "Не найден $CONF. Сначала запустите install.sh."
+# shellcheck source=/dev/null
+. "$CONF"
+
+export WINEPREFIX
+export WINEDEBUG="${WINEDEBUG:--all}"
+[ -n "${WINEARCH:-}" ] && export WINEARCH
+GAME_EXE="${GAME_EXE:-Colonization.exe}"
+
+doctor() {
+    local ok=1
+    check() { if eval "$2" >/dev/null 2>&1; then echo "  [ OK ] $1"; else echo "  [FAIL] $1${3:+ — $3}"; ok=0; fi; }
+    echo "Проверка установки Civ4 Colonization:"
+    check "Wine установлен ($(wine --version 2>/dev/null))" "command -v wine" "установите wine (см. README)"
+    check "Папка игры: $GAME_DIR" "[ -d \"\$GAME_DIR\" ]" "переустановите через install.sh"
+    check "Файл $GAME_EXE" "[ -f \"\$GAME_DIR/\$GAME_EXE\" ]"
+    check "Префикс Wine: $WINEPREFIX" "[ -f \"\$WINEPREFIX/system.reg\" ]" "запустите install.sh --skip-deps"
+    if command -v dpkg >/dev/null 2>&1; then
+        check "32-битный Wine (wine32:i386)" "dpkg -s wine32:i386" "sudo apt install wine32:i386"
+        check "32-битные драйверы OpenGL" "dpkg -s libgl1-mesa-dri:i386" "sudo apt install libgl1-mesa-dri:i386"
+    elif command -v pacman >/dev/null 2>&1; then
+        check "32-битный Mesa (lib32-mesa)" "pacman -Q lib32-mesa" "включите multilib и поставьте lib32-mesa"
+    fi
+    if command -v wineserver >/dev/null 2>&1 && pgrep -f "$GAME_EXE" >/dev/null 2>&1; then
+        echo "  [INFO] игра сейчас запущена (закрыть: civ4col --kill)"
+    fi
+    [ $ok = 1 ] && echo "Всё в порядке." || echo "Есть проблемы — см. README, раздел «Если не работает»."
+    [ $ok = 1 ]
+}
+
+window=""
+verbose=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -w|--window)  window="1920x1080" ;;
+        --window=*)   window="${1#*=}" ;;
+        -l|--log)     verbose=1 ;;
+        --winecfg)    exec wine winecfg ;;
+        --kill)       wineserver -k; exit $? ;;
+        --doctor)     doctor; exit $? ;;
+        -h|--help)    usage; exit 0 ;;
+        *)            usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+command -v wine >/dev/null 2>&1 || die "Wine не установлен. Запустите install.sh."
+[ -f "$GAME_DIR/$GAME_EXE" ] || die "Не найдена игра: $GAME_DIR/$GAME_EXE"
+cd "$GAME_DIR" || die "Не удалось открыть $GAME_DIR"
+
+mkdir -p "$STATE_DIR"
+[ $verbose = 1 ] && export WINEDEBUG="err+all,fixme-all"
+
+if [ -n "$window" ]; then
+    cmd=(wine explorer "/desktop=Civ4Col,$window" "$GAME_EXE")
+else
+    cmd=(wine "$GAME_EXE")
+fi
+# gamemode (если установлен) поднимает приоритет игры
+command -v gamemoderun >/dev/null 2>&1 && cmd=(gamemoderun "${cmd[@]}")
+
+echo "Запуск: ${cmd[*]}  (лог: $LOG)" >&2
+"${cmd[@]}" >"$LOG" 2>&1
+rc=$?
+# Wine часто возвращает ненулевой код при обычном выходе, поэтому
+# ругаемся только если игра упала сразу и в логе есть ошибки.
+if [ $rc -ne 0 ] && grep -qiE "err:|could not load|not found|failed" "$LOG"; then
+    die "Игра завершилась с ошибкой (код $rc). Последние строки лога:
+$(tail -n 15 "$LOG")
+
+Полный лог: $LOG"
+fi
+exit 0
